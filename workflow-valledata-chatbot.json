@@ -1,0 +1,330 @@
+{
+  "name": "ValleDATA — Asistente virtual",
+  "nodes": [
+    {
+      "parameters": {
+        "public": true,
+        "mode": "webhook",
+        "options": {
+          "responseMode": "lastNode",
+          "allowFileUploads": false,
+          "loadPreviousSession": "notSupported"
+        }
+      },
+      "id": "trigger-chat",
+      "name": "Chat entrante",
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -640,
+        300
+      ],
+      "webhookId": "valledata-chat"
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.VALLEDATA_TREE_URL || 'https://datosabiertos.valledelcauca.gov.co/static/chatbot/nodes.json' }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "load-tree",
+      "name": "Cargar árbol",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -420,
+        300
+      ],
+      "notes": "Sirve nodes.json como archivo estático del portal CKAN. Alternativa: pegar el JSON en un nodo Set, o leerlo con Read/Write Files from Disk."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// MOTOR DEL ÁRBOL — ValleDATA\n// Interpreta nodes.json. Para agregar, quitar o reescribir ramas\n// se edita nodes.json, no este código.\n// ============================================================\n\nconst arbol   = $input.first().json;\nconst nodos   = arbol.nodos;\nconst entrada = $('Chat entrante').first().json;\n\nconst mensaje   = (entrada.chatInput || '').trim();\nconst sessionId = entrada.sessionId || 'anon';\n\nconst UMBRAL = 1.2;   // debajo de esto, la pregunta va al RAG\n\n// ----------------------------------------------------- memoria de sesión\n// Sólo guardamos el último nodo mostrado, para poder resolver respuestas\n// numéricas (\"2\") contra las opciones de ese nodo. Nada más: el árbol es\n// apátrida por diseño, porque cada botón ya lleva su destino.\n//\n// En producción con varias instancias de n8n, reemplazar por Redis: la\n// memoria estática vive en el proceso y no se comparte entre workers.\nconst memoria = $getWorkflowStaticData('global');\nif (!memoria.sesiones) memoria.sesiones = {};\n\nfunction recordar(id) {\n  memoria.sesiones[sessionId] = { nodo: id, ts: Date.now() };\n\n  // Poda: sin esto la memoria crece sin techo. Borra lo que no se tocó en 2 h.\n  const LIMITE = 2 * 60 * 60 * 1000;\n  const ahora = Date.now();\n  for (const [sid, s] of Object.entries(memoria.sesiones)) {\n    if (ahora - s.ts > LIMITE) delete memoria.sesiones[sid];\n  }\n}\n\n// ------------------------------------------------ normalización y tokens\n\nconst STOP = new Set(['de','la','el','los','las','un','una','unos','unas','y','o','a','en','que','como','para','por','con','del','al','se','mi','me','es','son','lo','su','sus','puedo','quiero','necesito','tengo','hay','donde','cual','cuales','esta','este','estos','estas','mas','muy','pero','si','no','the','of']);\n\nfunction norm(s) {\n  return (s || '')\n    .toLowerCase()\n    .normalize('NFD').replace(/[\\u0300-\\u036f]/g, '')\n    .replace(/[^a-z0-9ñ\\s]/g, ' ')\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\nfunction stem(t) {\n  if (t.length <= 4) return t;\n  let s = t.replace(/(ciones|cion)$/, 'cion').replace(/(es|s)$/, '');\n  if (s.length > 5) s = s.replace(/(ando|endo|aron|ieron|amos|emos|imos|ar|er|ir|o|a|e)$/, '');\n  return s;\n}\n\nfunction tokens(s) {\n  return norm(s).split(' ').filter(t => t.length > 2 && !STOP.has(t)).map(stem);\n}\n\n// --------------------------------------------------------------- índice\n// Se reconstruye en cada ejecución: con ~80 nodos cuesta menos de 1 ms.\n// El IDF evita que palabras omnipresentes en este dominio (\"datos\",\n// \"conjunto\", \"portal\") decidan la clasificación.\n\nfunction indexar(nodos) {\n  const docs = {};\n  const df = new Map();\n\n  for (const [id, n] of Object.entries(nodos)) {\n    if (id.startsWith('_')) continue;\n\n    const kwFrases = (n.kw || []).map(norm).filter(k => k.includes(' '));\n    const kwTokens = new Set((n.kw || []).flatMap(k => tokens(k)));\n    const tituloTokens = new Set(tokens(n.titulo));\n    const cuerpoTokens = new Set(tokens([\n      n.texto, (n.pasos || []).join(' '), n.nota,\n      (n.opciones || []).map(o => o.label).join(' ')\n    ].join(' ')));\n\n    docs[id] = { kwFrases, kwTokens, kwArr: [...kwTokens], tituloTokens, cuerpoTokens };\n    for (const t of new Set([...kwTokens, ...tituloTokens, ...cuerpoTokens])) {\n      df.set(t, (df.get(t) || 0) + 1);\n    }\n  }\n\n  const N = Object.keys(docs).length;\n  const idf = new Map();\n  for (const [t, f] of df) idf.set(t, Math.max(0, Math.log(N / f) / Math.log(N)));\n\n  return { docs, idf };\n}\n\nfunction prefijoComun(a, b) {\n  return a.length >= 5 && b.length >= 5 && a.slice(0, 5) === b.slice(0, 5);\n}\n\nfunction clasificar(mensaje, idx) {\n  const textoNorm = norm(mensaje);\n  const consulta = tokens(mensaje);\n  if (!consulta.length) return { mejor: null, puntaje: 0 };\n\n  let mejor = null, mejorPuntaje = 0;\n\n  for (const [id, doc] of Object.entries(idx.docs)) {\n    let p = 0;\n\n    for (const frase of doc.kwFrases) if (textoNorm.includes(frase)) p += 6;\n\n    for (const t of consulta) {\n      const w = idx.idf.get(t) ?? 1;\n      if (doc.kwTokens.has(t)) p += 4 * w;\n      else if (doc.kwArr.some(k => prefijoComun(k, t))) p += 2 * w;\n      if (doc.tituloTokens.has(t)) p += 2 * w;\n      if (doc.cuerpoTokens.has(t)) p += 0.5 * w;\n    }\n\n    const normalizado = p / Math.max(consulta.length, 1);\n    if (normalizado > mejorPuntaje) { mejorPuntaje = normalizado; mejor = id; }\n  }\n\n  return { mejor, puntaje: +mejorPuntaje.toFixed(2) };\n}\n\n// ------------------------------------------------------ render de un nodo\n\nfunction render(id) {\n  const n = nodos[id];\n  if (!n) return render('_fallback');\n\n  recordar(id);\n\n  let out = '';\n  if (n.texto) out += n.texto + '\\n';\n\n  if (Array.isArray(n.pasos) && n.pasos.length) {\n    out += '\\n';\n    const numerado = n.tipo === 'pasos';\n    n.pasos.forEach((p, i) => {\n      out += (numerado ? `**${i + 1}.** ` : '• ') + p + '\\n';\n    });\n  }\n\n  if (n.nota) out += '\\n> ' + n.nota.replace(/\\n/g, '\\n> ') + '\\n';\n\n  return {\n    nodo: id,\n    titulo: n.titulo || '',\n    texto: out.trim(),\n    url: n.url || null,\n    botones: (n.opciones || []).map(o => ({ label: o.label, value: '__nav__:' + o.next })),\n    fuente: n.src || null,\n    resuelto: true,\n  };\n}\n\n// --------------------------------------------------------------- ruteo\n\n// 1. Click de botón: navegación determinista, sin ambigüedad.\nif (mensaje.startsWith('__nav__:')) {\n  const destino = mensaje.slice(8).trim();\n  return [{ json: { ...render(nodos[destino] ? destino : '_fallback'), via: 'boton' } }];\n}\n\n// 2. Respuesta numérica (\"2\", \"opción 3\"): se resuelve contra las opciones\n//    del último nodo que le mostramos a esta sesión.\nconst soloNumero = mensaje.match(/^(?:opcion\\s*|opción\\s*|n[°º]\\s*)?(\\d{1,2})[.)]?$/i);\nif (soloNumero) {\n  const i = parseInt(soloNumero[1], 10) - 1;\n  const ultimo = memoria.sesiones[sessionId]?.nodo;\n  const opciones = ultimo ? (nodos[ultimo]?.opciones || []) : [];\n\n  if (i >= 0 && i < opciones.length) {\n    return [{ json: { ...render(opciones[i].next), via: 'numero' } }];\n  }\n  // Número fuera de rango, o sesión sin contexto: repetimos el menú en vez\n  // de mandar un número suelto al RAG, que no tiene cómo interpretarlo.\n  return [{ json: { ...render(ultimo && nodos[ultimo] ? ultimo : 'menu_principal'), via: 'numero-invalido' } }];\n}\n\n// 3. Saludo o mensaje vacío: menú principal.\nconst SALUDOS = /^(hola|buenas|buenos dias|buenas tardes|buenas noches|hey|hi|hello|menu|inicio|empezar|volver|ayuda|help)\\b/i;\nif (!mensaje || SALUDOS.test(norm(mensaje))) {\n  return [{ json: { ...render('menu_principal'), via: 'saludo' } }];\n}\n\n// 4. Texto libre: ¿lo cubre alguna rama del árbol?\nconst idx = indexar(nodos);\nconst r = clasificar(mensaje, idx);\n\nif (r.mejor && r.puntaje >= UMBRAL) {\n  return [{ json: { ...render(r.mejor), via: 'arbol', puntaje: r.puntaje } }];\n}\n\n// 5. Sin match confiable: que responda el RAG sobre los manuales.\nreturn [{\n  json: {\n    resuelto: false,\n    via: 'rag',\n    pregunta: mensaje,\n    sessionId,\n    candidato: r.mejor,\n    puntaje: r.puntaje,\n  }\n}];\n"
+      },
+      "id": "motor-arbol",
+      "name": "Motor del árbol",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-resuelto",
+              "leftValue": "={{ $json.resuelto }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-resuelto",
+      "name": "¿Lo resolvió el árbol?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        40,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.pregunta }}",
+        "options": {
+          "systemPromptTemplate": "Sos el asistente virtual de ValleDATA, el portal de datos abiertos de la Gobernación del Valle del Cauca.\n\nRESPONDÉ ÚNICAMENTE con información que esté en el contexto recuperado de los manuales. Si el contexto no alcanza para responder, decí exactamente: \"No encontré esa información en los manuales de ValleDATA.\" y no inventes nada.\n\nREGLAS DE VOCABULARIO — usá siempre la terminología del portal, nunca la de CKAN:\n- \"Dependencia\" (no \"organización\")\n- \"Temática\" (no \"grupo\")\n- \"conjunto de datos\" (no \"dataset\")\n- \"recurso\" para cada archivo dentro de un conjunto\n\nESTILO:\n- Hablás con ciudadanos, no con técnicos. Frases cortas, sin jerga.\n- Si la respuesta son pasos de la interfaz, numeralos y nombrá los botones exactamente como aparecen en el portal, entre comillas angulares: «Descargas», «Aplicar filtros».\n- Máximo 6 líneas. Si el tema es largo, respondé lo esencial y ofrecé profundizar.\n- No inventes URLs, nombres de botones ni funciones que no estén en el contexto.\n- Nunca pidas ni aceptes contraseñas, cédulas ni datos personales.\n\nAl final de tu respuesta, en una línea aparte, citá la sección del manual de donde sacaste la información, con este formato exacto: _Fuente: <manual>, <sección>_\n\nContexto recuperado de los manuales:\n{context}\n\nPregunta del ciudadano: {input}"
+        }
+      },
+      "id": "rag-chain",
+      "name": "Consulta a los manuales (RAG)",
+      "type": "@n8n/n8n-nodes-langchain.chainRetrievalQa",
+      "typeVersion": 1.5,
+      "position": [
+        260,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "model": "claude-sonnet-5",
+        "options": {
+          "temperature": 0.2,
+          "maxTokensToSample": 700
+        }
+      },
+      "id": "llm",
+      "name": "Modelo de lenguaje",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.3,
+      "position": [
+        180,
+        680
+      ]
+    },
+    {
+      "parameters": {
+        "topK": 6
+      },
+      "id": "retriever",
+      "name": "Recuperador",
+      "type": "@n8n/n8n-nodes-langchain.retrieverVectorStore",
+      "typeVersion": 1,
+      "position": [
+        400,
+        680
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "retrieve",
+        "qdrantCollection": {
+          "__rl": true,
+          "value": "valledata_manuales",
+          "mode": "list"
+        },
+        "options": {}
+      },
+      "id": "vector-store",
+      "name": "Qdrant — manuales",
+      "type": "@n8n/n8n-nodes-langchain.vectorStoreQdrant",
+      "typeVersion": 1.1,
+      "position": [
+        400,
+        860
+      ]
+    },
+    {
+      "parameters": {
+        "model": "text-embedding-3-small",
+        "options": {}
+      },
+      "id": "embeddings",
+      "name": "Embeddings",
+      "type": "@n8n/n8n-nodes-langchain.embeddingsOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        400,
+        1040
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normaliza la salida del RAG al mismo formato que produce el\n// motor del árbol, para que el widget reciba siempre lo mismo.\n\nconst r = $input.first().json;\nconst texto = (r.response?.text || r.text || r.output || '').trim();\n\nconst NO_SE = /no encontr[eé] esa informaci[oó]n/i;\n\nif (!texto || NO_SE.test(texto)) {\n  return [{\n    json: {\n      nodo: '_fallback',\n      titulo: 'No encontré eso',\n      texto: 'No encontré esa información en los manuales de ValleDATA.\\n\\n¿Querés que te lleve al menú, o preferís contactar al equipo del portal?',\n      botones: [\n        { label: 'Ir al menú principal', value: '__nav__:menu_principal' },\n        { label: 'Contactar al equipo',  value: '__nav__:contacto' }\n      ],\n      via: 'rag-sin-resultado'\n    }\n  }];\n}\n\nreturn [{\n  json: {\n    nodo: 'rag',\n    titulo: '',\n    texto,\n    botones: [\n      { label: 'Ver el menú',      value: '__nav__:menu_principal' },\n      { label: 'No me sirvió',     value: '__nav__:_handoff' }\n    ],\n    via: 'rag'\n  }\n}];"
+      },
+      "id": "formatear-rag",
+      "name": "Formatear respuesta RAG",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        620,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Salida única del workflow. El widget lee `output` para el texto\n// y `botones` para pintar las opciones.\n\nconst r = $input.first().json;\n\nlet salida = '';\nif (r.titulo) salida += '**' + r.titulo + '**\\n\\n';\nsalida += r.texto || '';\n\nreturn [{\n  json: {\n    output: salida.trim(),\n    botones: r.botones || [],\n    nodo: r.nodo || null,\n    url: r.url || null,\n    via: r.via || 'arbol',\n    fuente: r.fuente || null\n  }\n}];"
+      },
+      "id": "respuesta",
+      "name": "Respuesta al widget",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Chat entrante": {
+      "main": [
+        [
+          {
+            "node": "Cargar árbol",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cargar árbol": {
+      "main": [
+        [
+          {
+            "node": "Motor del árbol",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Motor del árbol": {
+      "main": [
+        [
+          {
+            "node": "¿Lo resolvió el árbol?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Lo resolvió el árbol?": {
+      "main": [
+        [
+          {
+            "node": "Respuesta al widget",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Consulta a los manuales (RAG)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Consulta a los manuales (RAG)": {
+      "main": [
+        [
+          {
+            "node": "Formatear respuesta RAG",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Formatear respuesta RAG": {
+      "main": [
+        [
+          {
+            "node": "Respuesta al widget",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Modelo de lenguaje": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Consulta a los manuales (RAG)",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Recuperador": {
+      "ai_retriever": [
+        [
+          {
+            "node": "Consulta a los manuales (RAG)",
+            "type": "ai_retriever",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Qdrant — manuales": {
+      "ai_vectorStore": [
+        [
+          {
+            "node": "Recuperador",
+            "type": "ai_vectorStore",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embeddings": {
+      "ai_embedding": [
+        [
+          {
+            "node": "Qdrant — manuales",
+            "type": "ai_embedding",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "valledata"
+  },
+  "tags": [
+    {
+      "name": "ValleDATA"
+    }
+  ]
+}

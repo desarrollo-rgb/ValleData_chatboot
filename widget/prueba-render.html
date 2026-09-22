@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>ValleDATA — Banco de pruebas del renderizado</title>
+  <style>
+    body {
+      margin: 0; font-family: system-ui, sans-serif;
+      background: #0f1115; color: #e8e8e8;
+      display: flex; flex-direction: column; align-items: center;
+      justify-content: center; min-height: 100vh; padding: 24px;
+      box-sizing: border-box;
+    }
+    .aviso { max-width: 560px; line-height: 1.5; }
+    .aviso code { background: #1e2129; padding: 2px 6px; border-radius: 4px; }
+    .aviso li { margin-bottom: 6px; }
+    h2 { margin-top: 0; }
+  </style>
+</head>
+<body>
+  <div class="aviso">
+    <h2>Banco de pruebas del renderizado</h2>
+    <p>
+      Prueba <code>renderTexto()</code> del widget sin necesidad de n8n: se
+      reemplaza <code>fetch</code> por una cola de casos de prueba. Abrí el chat
+      abajo a la derecha y andá tocando <b>«Siguiente caso»</b>.
+    </p>
+    <p>Qué mirar en cada caso:</p>
+    <ol>
+      <li><b>2 columnas</b> — encabezado con línea turquesa, <b>sin</b> scroll horizontal, sin desbordar el panel.</li>
+      <li><b>4 columnas</b> — aparece scroll horizontal dentro del recuadro, y el panel <b>no</b> se ensancha.</li>
+      <li><b>Malformada</b> — sin separadora no es tabla: sale como dos párrafos con los pipes a la vista.</li>
+      <li><b>Filas desparejas</b> — 2 columnas parejas, la celda vacía queda vacía, y <code>sobrante</code> aparece pegado a la última celda.</li>
+      <li><b>XSS y escapes</b> — abrí el inspector: el <code>&lt;td&gt;</code> debe contener <code>&amp;lt;img…</code> como <b>texto</b>, y <b>no</b> debe existir ningún elemento <code>img</code> en el DOM. La negrita sí se aplica y <code>a | b</code> queda en una sola celda.</li>
+      <li><b>Tabla al final</b> — sin salto de línea posterior, igual cierra bien.</li>
+      <li><b>Regresión sin tabla</b> — negrita, viñetas, pasos numerados y cita deben verse igual que siempre.</li>
+    </ol>
+    <p>Probá también angostando la ventana a ~360px para verificar el <code>@media</code>.</p>
+  </div>
+
+  <script>
+    // Cola de casos. Cada "respuesta" del webhook falso es un caso.
+    var casos = [
+      {
+        titulo: '1. Dos columnas (el caso previsto)',
+        texto: 'Estos son los metadatos mínimos que tenés que completar:\n\n| Campo | Qué poner |\n|---|---|\n| Título | Qué, dónde, cuándo y vigencia |\n| Descripción | Origen, finalidad y alcance territorial |\n| Licencia | CC BY-SA 4.0 |\n| Frecuencia | Diaria, mensual, trimestral o anual |\n\n> Si dejás mal la frecuencia, el conjunto aparece como desactualizado.'
+      },
+      {
+        titulo: '2. Cuatro columnas (debe scrollear)',
+        texto: 'Taxonomía resumida:\n\n| Tipo | Pregunta | Qué hace | Ejemplo |\n| :--- | :---: | ---: | --- |\n| Descriptiva | ¿Qué pasó? | Agrupa registros históricos | Raciones PAE en Yotoco |\n| Diagnóstica | ¿Por qué pasó? | Cruza variables | Deserción escolar en Trujillo |'
+      },
+      {
+        titulo: '3. Malformada (sin separadora)',
+        texto: 'Esto no es una tabla porque falta la línea separadora:\n\n| Campo | Valor |\n| Título | Algo |'
+      },
+      {
+        titulo: '4. Filas desparejas y celdas vacías',
+        texto: '| A | B |\n|---|---|\n| solo-una |\n|  | vacía a la izquierda |\n| x | y | sobrante |'
+      },
+      {
+        titulo: '5. XSS, negrita y pipe escapado',
+        texto: '| Campo | Valor |\n|---|---|\n| <img src=x onerror=alert(1)> | **en negrita** |\n| pipe escapado | a \\| b |\n| comillas | "dobles" y \'simples\' |\n| ampersand | Salud & Educación |'
+      },
+      {
+        titulo: '6. Tabla al final del texto',
+        texto: 'Un párrafo previo para dar contexto.\n\n| Clave | Valor |\n|---|---|\n| a | b |'
+      },
+      {
+        titulo: '7. Regresión: sin ninguna tabla',
+        texto: 'Párrafo normal con **algo en negrita** adentro.\n\n**1.** Primer paso del procedimiento\n**2.** Segundo paso del procedimiento\n• una viñeta suelta\n\n> Esto es una nota al pie, que va como cita.'
+      }
+    ];
+
+    var n = 0;
+    // Webhook falso: devuelve el siguiente caso de la cola.
+    window.fetch = function () {
+      var c = casos[Math.min(n, casos.length - 1)];
+      n++;
+      var quedan = n < casos.length;
+      return Promise.resolve({
+        ok: true,
+        json: function () {
+          return Promise.resolve({
+            titulo: c.titulo,
+            texto: c.texto,
+            url: null,
+            botones: quedan
+              ? [{ label: 'Siguiente caso →', value: '__nav__:siguiente' }]
+              : [],
+            nodo: 'prueba',
+            via: 'prueba'
+          });
+        }
+      });
+    };
+  </script>
+
+  <script src="valledata-chat.js"></script>
+  <script>
+    createValledataChat({
+      webhookUrl: 'about:blank',   // nunca se usa: fetch está reemplazado
+      title: 'Prueba de renderizado',
+      subtitle: 'Casos de tabla, escapes y regresión'
+    });
+  </script>
+</body>
+</html>

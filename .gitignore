@@ -1,0 +1,12 @@
+# Secretos: nunca versionar
+.env
+.env.*
+!.env.ejemplo
+
+# Credenciales exportadas de n8n (contienen el token en claro)
+*credencial*.json
+_import.json
+
+node_modules/
+
+prueba-web.html
