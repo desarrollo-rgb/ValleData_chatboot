@@ -1,0 +1,145 @@
+name: Deploy to qa
+
+# Ver Fase 3 de docs/planes/2026-09-27-cicd-n8n-workflow.md (repo
+# datosabiertos-devops). Dispara en push a "qa" (mismo nombre de rama que
+# ya usa datosabiertos-ckan para su propio ambiente de qa). Un solo job,
+# sin gate — a diferencia de deploy-prod.yaml, que sí lo tiene.
+#
+# A diferencia de api_valledata/CKAN, acá no hay build de imagen: el
+# "build" es regenerar el JSON del workflow desde nodes.json + motor.js
+# (build-local.mjs, sin dependencias npm), y el "deploy" es copiar ese
+# JSON dentro del pod y hacer que n8n lo importe — no hay swap de imagen
+# ni "kubectl apply -k" de un Deployment.
+
+on:
+  push:
+    branches: [qa]
+
+jobs:
+  build-and-deploy:
+    name: Build, backup, deploy y smoke-test en qa
+    runs-on: ubuntu-latest
+    environment: qa
+    permissions:
+      id-token: write   # requerido por Workload Identity Federation
+      contents: read
+
+    env:
+      DEVOPS_REPO: desarrollo-rgb/datosabiertos-devops
+      GKE_NAMESPACE: chatbot
+      GKE_POD: n8n-0
+      WORKFLOW_ID: valledataLocal01
+      GCS_BUCKET: co-valledata-prd-n8n-workflow-backups
+
+    steps:
+      - name: Checkout ValleData_chatboot
+        uses: actions/checkout@v4
+
+      # Se necesita ANTES del backup/deploy, no solo para el commit-back
+      # del final: acá viven los scripts que se ejecutan dentro del pod
+      # (scripts/chatbot/*.sh).
+      - name: Checkout datosabiertos-devops
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DEVOPS_REPO }}
+          ref: develop
+          token: ${{ secrets.DEVOPS_REPO_TOKEN }}
+          path: datosabiertos-devops
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Sin dependencias npm (no hay package.json) — solo node:fs/promises.
+      - name: Build del workflow (nodes.json + motor.js -> JSON de n8n)
+        run: node build-local.mjs
+
+      # -----------------------------------------------------------------
+      # Auth vía Workload Identity Federation — sin claves de service
+      # account. WIF_PROVIDER/GCP_SA_EMAIL vienen del GitHub Environment
+      # "qa" (outputs de la Fase 1 del plan: wif_provider y
+      # n8n_github_actions_sa_email, en terraform/environments/qa/outputs.tf
+      # de datosabiertos-devops).
+      # -----------------------------------------------------------------
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SA_EMAIL }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Install gke-gcloud-auth-plugin
+        run: gcloud components install gke-gcloud-auth-plugin --quiet
+
+      - name: Get gke-primary credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: gke-primary
+          location: us-east1
+          project_id: co-valledata-prd
+
+      # -----------------------------------------------------------------
+      # Backup del workflow ACTIVO antes de sobrescribirlo — n8n no tiene
+      # rollback nativo (SQLite en un PVC de una sola réplica), esto es la
+      # única red de seguridad real. Sube a GCS, no se queda solo en el
+      # runner (efímero). Ver Fase 2 del plan (exportar-workflow-pod.sh,
+      # ya probado a mano).
+      # -----------------------------------------------------------------
+      - name: Backup del workflow activo
+        run: |
+          set -euo pipefail
+          kubectl exec -i -n "$GKE_NAMESPACE" "$GKE_POD" -- sh -s "$WORKFLOW_ID" \
+            < datosabiertos-devops/scripts/chatbot/exportar-workflow-pod.sh
+          kubectl cp "$GKE_NAMESPACE/$GKE_POD:/tmp/backup.json" ./backup.json
+          TS=$(date -u +%Y%m%dT%H%M%SZ)
+          OBJ="qa/${TS}-${{ github.sha }}.json"
+          gcloud storage cp ./backup.json "gs://$GCS_BUCKET/$OBJ"
+          echo "OBJ=$OBJ" >> "$GITHUB_ENV"
+          echo "backup subido a gs://$GCS_BUCKET/$OBJ"
+
+      # -----------------------------------------------------------------
+      # Deploy: copia el workflow nuevo al pod, lo importa y activa, y
+      # reinicia el StatefulSet (sin el reinicio el webhook da 404 aunque
+      # el workflow figure activo). Sin allowFailure ni "|| echo": si el
+      # rollout falla, el job falla en rojo.
+      # -----------------------------------------------------------------
+      - name: Deploy del workflow nuevo
+        run: |
+          set -euo pipefail
+          kubectl cp ./workflow-local-solo-arbol.json "$GKE_NAMESPACE/$GKE_POD:/tmp/wf.json"
+          kubectl exec -i -n "$GKE_NAMESPACE" "$GKE_POD" -- sh -s "$WORKFLOW_ID" \
+            < datosabiertos-devops/scripts/chatbot/importar-workflow-pod.sh
+          kubectl rollout restart statefulset/n8n -n "$GKE_NAMESPACE"
+          kubectl rollout status statefulset/n8n -n "$GKE_NAMESPACE" --timeout=300s
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          kubectl cp ./nodes.json "$GKE_NAMESPACE/$GKE_POD:/tmp/nodes.json"
+          kubectl exec -i -n "$GKE_NAMESPACE" "$GKE_POD" -- sh -s \
+            < datosabiertos-devops/scripts/chatbot/prueba-humo-pod.sh
+
+      # -----------------------------------------------------------------
+      # Commit-back a datosabiertos-devops: marca qué SHA de
+      # ValleData_chatboot quedó importado en qa y en qué backup se puede
+      # confiar para un rollback — trazabilidad tipo GitOps aunque acá no
+      # haya swap de imagen de por medio.
+      # -----------------------------------------------------------------
+      - name: Commit-back del marcador de deploy
+        working-directory: datosabiertos-devops
+        run: |
+          set -euo pipefail
+          mkdir -p k8s/environments/qa/chatbot
+          cat > k8s/environments/qa/chatbot/DEPLOYED.env <<EOF
+          WORKFLOW_SHA=${{ github.sha }}
+          DEPLOYED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          BACKUP=gs://${{ env.GCS_BUCKET }}/${{ env.OBJ }}
+          EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add k8s/environments/qa/chatbot/DEPLOYED.env
+          git commit -m "deploy(n8n qa): workflow ${{ github.sha }}"
+          git push origin develop
