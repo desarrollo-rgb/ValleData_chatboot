@@ -1,9 +1,8 @@
 name: Rollback n8n workflow
 
-# Ver Fase 6 de docs/planes/2026-09-27-cicd-n8n-workflow.md (repo
-# datosabiertos-devops). El backup a GCS que ya toman deploy-qa.yaml/
-# deploy-prod.yaml (Fases 3/5) era una red de seguridad pasiva sin forma de
-# usarla — este workflow es el camino de restauración.
+# El backup a GCS que ya toman deploy-qa.yaml/deploy-prod.yaml era una red
+# de seguridad pasiva sin forma de usarla — este workflow es el camino de
+# restauración.
 #
 # Disparo manual (workflow_dispatch, no push), con el mismo mecanismo de
 # importación que los deploys (importar-workflow-pod.sh: "restaurar" es

@@ -1,18 +1,15 @@
 name: Deploy to prod
 
-# Ver Fase 5 de docs/planes/2026-09-27-cicd-n8n-workflow.md (repo
-# datosabiertos-devops). Mismo mecanismo que deploy-qa.yaml (WIF, backup a
-# GCS, kubectl cp + exec del import, rollout restart/status sin swallow,
-# smoke-test, commit-back del marcador), pero:
+# Mismo mecanismo que deploy-qa.yaml (WIF, backup a GCS, kubectl cp + exec
+# del import, rollout restart/status sin swallow, smoke-test, commit-back
+# del marcador), pero:
 #   - dispara en push a "master" (no "qa").
-#   - separado en DOS jobs: el build queda en un job sin gate; todo lo que
-#     toca el cluster real (backup, deploy, smoke-test, commit-back) queda
-#     detrás del GitHub Environment "prod-deploy" (required reviewers) —
-#     aprobación manual obligatoria antes de tocar prod, a diferencia de
-#     CKAN. A diferencia de api_valledata (imagen inmutable, rollback
-#     trivial), acá no hay nada que comprometer con un build sin gate: el
-#     build solo regenera el JSON del workflow a partir de nodes.json +
-#     motor.js, no toca GCP ni el cluster.
+#   - separado en DOS jobs: el build queda en un job sin gate (solo
+#     regenera el JSON del workflow a partir de nodes.json + motor.js, no
+#     toca GCP ni el cluster); todo lo que sí toca el cluster real (backup,
+#     deploy, smoke-test, commit-back) queda detrás del GitHub Environment
+#     "prod-deploy" (required reviewers) — aprobación manual obligatoria
+#     antes de tocar prod.
 #   - un solo cluster (gke-primary): n8n corre solo ahí a propósito (SQLite
 #     en un PVC de una sola réplica, ver terraform/environments/prod/n8n.tf)
 #     — no hay instancia en gke-dr.
@@ -88,9 +85,9 @@ jobs:
       # -----------------------------------------------------------------
       # Auth vía Workload Identity Federation — sin claves de service
       # account. WIF_PROVIDER/GCP_SA_EMAIL vienen del GitHub Environment
-      # "prod-deploy" (outputs de la Fase 4 del plan: wif_provider y
-      # n8n_github_actions_sa_email, en
-      # terraform/environments/prod/outputs.tf de datosabiertos-devops).
+      # "prod-deploy" (valores = outputs wif_provider/
+      # n8n_github_actions_sa_email de terraform/environments/prod/outputs.tf
+      # en datosabiertos-devops).
       # -----------------------------------------------------------------
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
