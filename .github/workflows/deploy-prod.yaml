@@ -1,0 +1,174 @@
+name: Deploy to prod
+
+# Ver Fase 5 de docs/planes/2026-09-27-cicd-n8n-workflow.md (repo
+# datosabiertos-devops). Mismo mecanismo que deploy-qa.yaml (WIF, backup a
+# GCS, kubectl cp + exec del import, rollout restart/status sin swallow,
+# smoke-test, commit-back del marcador), pero:
+#   - dispara en push a "master" (no "qa").
+#   - separado en DOS jobs: el build queda en un job sin gate; todo lo que
+#     toca el cluster real (backup, deploy, smoke-test, commit-back) queda
+#     detrás del GitHub Environment "prod-deploy" (required reviewers) —
+#     aprobación manual obligatoria antes de tocar prod, a diferencia de
+#     CKAN. A diferencia de api_valledata (imagen inmutable, rollback
+#     trivial), acá no hay nada que comprometer con un build sin gate: el
+#     build solo regenera el JSON del workflow a partir de nodes.json +
+#     motor.js, no toca GCP ni el cluster.
+#   - un solo cluster (gke-primary): n8n corre solo ahí a propósito (SQLite
+#     en un PVC de una sola réplica, ver terraform/environments/prod/n8n.tf)
+#     — no hay instancia en gke-dr.
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  build-and-commit:
+    name: Build del workflow (sin tocar el cluster)
+    runs-on: ubuntu-latest
+    environment: prod
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout ValleData_chatboot
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Sin dependencias npm (no hay package.json) — solo node:fs/promises.
+      - name: Build del workflow (nodes.json + motor.js -> JSON de n8n)
+        run: node build-local.mjs
+
+      # Se pasa al job gateado vía artifact, no vía checkout: el job de
+      # deploy corre en un runner nuevo y necesita este JSON ya generado.
+      - name: Subir artifact del build
+        uses: actions/upload-artifact@v4
+        with:
+          name: workflow-build
+          path: |
+            workflow-local-solo-arbol.json
+            nodes.json
+          retention-days: 7
+
+  deploy-prod:
+    name: Deploy a producción (requiere aprobación manual)
+    needs: build-and-commit
+    runs-on: ubuntu-latest
+    environment: prod-deploy   # GitHub Environment con "required reviewers"
+    permissions:
+      id-token: write   # requerido por Workload Identity Federation
+      contents: read
+
+    env:
+      DEVOPS_REPO: desarrollo-rgb/datosabiertos-devops
+      GKE_NAMESPACE: chatbot
+      GKE_POD: n8n-0
+      WORKFLOW_ID: valledataLocal01
+      GCS_BUCKET: co-valledata-pub-prd-n8n-workflow-backups
+
+    steps:
+      - name: Descargar artifact del build
+        uses: actions/download-artifact@v4
+        with:
+          name: workflow-build
+
+      # Acá viven los scripts que se ejecutan dentro del pod
+      # (scripts/chatbot/*.sh) y el overlay donde se commitea el marcador.
+      - name: Checkout datosabiertos-devops
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DEVOPS_REPO }}
+          ref: develop
+          token: ${{ secrets.DEVOPS_REPO_TOKEN }}
+          path: datosabiertos-devops
+
+      # -----------------------------------------------------------------
+      # Auth vía Workload Identity Federation — sin claves de service
+      # account. WIF_PROVIDER/GCP_SA_EMAIL vienen del GitHub Environment
+      # "prod-deploy" (outputs de la Fase 4 del plan: wif_provider y
+      # n8n_github_actions_sa_email, en
+      # terraform/environments/prod/outputs.tf de datosabiertos-devops).
+      # -----------------------------------------------------------------
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SA_EMAIL }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Install gke-gcloud-auth-plugin
+        run: gcloud components install gke-gcloud-auth-plugin --quiet
+
+      - name: Get gke-primary credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: gke-primary
+          location: us-east1
+          project_id: co-valledata-pub-prd
+
+      # -----------------------------------------------------------------
+      # Backup del workflow ACTIVO antes de sobrescribirlo — n8n no tiene
+      # rollback nativo (SQLite en un PVC de una sola réplica), esto es la
+      # única red de seguridad real. Sube a GCS, no se queda solo en el
+      # runner (efímero).
+      # -----------------------------------------------------------------
+      - name: Backup del workflow activo
+        run: |
+          set -euo pipefail
+          kubectl exec -i -n "$GKE_NAMESPACE" "$GKE_POD" -- sh -s "$WORKFLOW_ID" \
+            < datosabiertos-devops/scripts/chatbot/exportar-workflow-pod.sh
+          kubectl cp "$GKE_NAMESPACE/$GKE_POD:/tmp/backup.json" ./backup.json
+          TS=$(date -u +%Y%m%dT%H%M%SZ)
+          OBJ="prod/${TS}-${{ github.sha }}.json"
+          gcloud storage cp ./backup.json "gs://$GCS_BUCKET/$OBJ"
+          echo "OBJ=$OBJ" >> "$GITHUB_ENV"
+          echo "backup subido a gs://$GCS_BUCKET/$OBJ"
+
+      # -----------------------------------------------------------------
+      # Deploy: copia el workflow nuevo al pod, lo importa y activa, y
+      # reinicia el StatefulSet (sin el reinicio el webhook da 404 aunque
+      # el workflow figure activo). Sin allowFailure ni "|| echo": si el
+      # rollout falla, el job falla en rojo.
+      # -----------------------------------------------------------------
+      - name: Deploy del workflow nuevo
+        run: |
+          set -euo pipefail
+          kubectl cp ./workflow-local-solo-arbol.json "$GKE_NAMESPACE/$GKE_POD:/tmp/wf.json"
+          kubectl exec -i -n "$GKE_NAMESPACE" "$GKE_POD" -- sh -s "$WORKFLOW_ID" \
+            < datosabiertos-devops/scripts/chatbot/importar-workflow-pod.sh
+          kubectl rollout restart statefulset/n8n -n "$GKE_NAMESPACE"
+          kubectl rollout status statefulset/n8n -n "$GKE_NAMESPACE" --timeout=300s
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          kubectl cp ./nodes.json "$GKE_NAMESPACE/$GKE_POD:/tmp/nodes.json"
+          kubectl exec -i -n "$GKE_NAMESPACE" "$GKE_POD" -- sh -s \
+            < datosabiertos-devops/scripts/chatbot/prueba-humo-pod.sh
+
+      # -----------------------------------------------------------------
+      # Commit-back a datosabiertos-devops: marca qué SHA de
+      # ValleData_chatboot quedó importado en prod y en qué backup se puede
+      # confiar para un rollback — trazabilidad tipo GitOps aunque acá no
+      # haya swap de imagen de por medio.
+      # -----------------------------------------------------------------
+      - name: Commit-back del marcador de deploy
+        working-directory: datosabiertos-devops
+        run: |
+          set -euo pipefail
+          mkdir -p k8s/environments/prod/chatbot
+          cat > k8s/environments/prod/chatbot/DEPLOYED.env <<EOF
+          WORKFLOW_SHA=${{ github.sha }}
+          DEPLOYED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          BACKUP=gs://${{ env.GCS_BUCKET }}/${{ env.OBJ }}
+          EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add k8s/environments/prod/chatbot/DEPLOYED.env
+          git commit -m "deploy(n8n prod): workflow ${{ github.sha }}"
+          git push origin develop
