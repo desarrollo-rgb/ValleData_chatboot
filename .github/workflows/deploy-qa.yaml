@@ -1,15 +1,13 @@
 name: Deploy to qa
 
-# Ver Fase 3 de docs/planes/2026-09-27-cicd-n8n-workflow.md (repo
-# datosabiertos-devops). Dispara en push a "qa" (mismo nombre de rama que
-# ya usa datosabiertos-ckan para su propio ambiente de qa). Un solo job,
-# sin gate — a diferencia de deploy-prod.yaml, que sí lo tiene.
+# Dispara en push a "qa" (mismo nombre de rama que ya usa
+# datosabiertos-ckan para su propio ambiente de qa). Un solo job, sin gate
+# — a diferencia de deploy-prod.yaml, que sí lo tiene.
 #
-# A diferencia de api_valledata/CKAN, acá no hay build de imagen: el
-# "build" es regenerar el JSON del workflow desde nodes.json + motor.js
-# (build-local.mjs, sin dependencias npm), y el "deploy" es copiar ese
-# JSON dentro del pod y hacer que n8n lo importe — no hay swap de imagen
-# ni "kubectl apply -k" de un Deployment.
+# Acá no hay build de imagen: el "build" es regenerar el JSON del workflow
+# desde nodes.json + motor.js (build-local.mjs, sin dependencias npm), y
+# el "deploy" es copiar ese JSON dentro del pod y hacer que n8n lo importe
+# — no hay swap de imagen ni "kubectl apply -k" de un Deployment.
 
 on:
   push:
@@ -58,9 +56,8 @@ jobs:
       # -----------------------------------------------------------------
       # Auth vía Workload Identity Federation — sin claves de service
       # account. WIF_PROVIDER/GCP_SA_EMAIL vienen del GitHub Environment
-      # "qa" (outputs de la Fase 1 del plan: wif_provider y
-      # n8n_github_actions_sa_email, en terraform/environments/qa/outputs.tf
-      # de datosabiertos-devops).
+      # "qa" (valores = outputs wif_provider/n8n_github_actions_sa_email de
+      # terraform/environments/qa/outputs.tf en datosabiertos-devops).
       # -----------------------------------------------------------------
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -85,8 +82,7 @@ jobs:
       # Backup del workflow ACTIVO antes de sobrescribirlo — n8n no tiene
       # rollback nativo (SQLite en un PVC de una sola réplica), esto es la
       # única red de seguridad real. Sube a GCS, no se queda solo en el
-      # runner (efímero). Ver Fase 2 del plan (exportar-workflow-pod.sh,
-      # ya probado a mano).
+      # runner (efímero).
       # -----------------------------------------------------------------
       - name: Backup del workflow activo
         run: |
