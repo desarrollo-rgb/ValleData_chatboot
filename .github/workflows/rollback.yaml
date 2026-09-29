@@ -1,0 +1,166 @@
+name: Rollback n8n workflow
+
+# Ver Fase 6 de docs/planes/2026-09-27-cicd-n8n-workflow.md (repo
+# datosabiertos-devops). El backup a GCS que ya toman deploy-qa.yaml/
+# deploy-prod.yaml (Fases 3/5) era una red de seguridad pasiva sin forma de
+# usarla — este workflow es el camino de restauración.
+#
+# Disparo manual (workflow_dispatch, no push), con el mismo mecanismo de
+# importación que los deploys (importar-workflow-pod.sh: "restaurar" es
+# reimportar un JSON viejo). Un solo archivo para los dos ambientes: el
+# input "environment" selecciona el Environment de GitHub (gate incluido),
+# y de ahí salen las credenciales/bucket/cluster correspondientes.
+#
+# Vive solo en "master" (no hace falta duplicarlo en "qa"): hace su propio
+# checkout explícito de la rama de ValleData_chatboot que corresponda al
+# ambiente elegido (para el nodes.json del smoke-test), sin depender de
+# desde qué rama se dispare.
+#
+# En prod corre bajo el mismo Environment "prod-deploy" gateado que
+# deploy-prod.yaml — un rollback mal apuntado (backup_object equivocado)
+# también necesita aprobación humana; no es excepción por ser "emergencia":
+# aprobar es un clic, y evita empeorar un incidente con el archivo
+# equivocado.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Ambiente a restaurar"
+        required: true
+        type: choice
+        options:
+          - qa
+          - prod
+      backup_object:
+        description: >-
+          Path del backup en GCS a restaurar, SIN el prefijo gs://bucket/
+          (ej: qa/20260928T120000Z-<sha>.json). Ver el marcador
+          DEPLOYED.env del ambiente en datosabiertos-devops, o listar el
+          bucket, para elegir uno.
+        required: true
+        type: string
+
+jobs:
+  rollback:
+    name: Restaurar workflow desde backup
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment == 'prod' && 'prod-deploy' || 'qa' }}
+    permissions:
+      id-token: write   # requerido por Workload Identity Federation
+      contents: read
+
+    env:
+      DEVOPS_REPO: desarrollo-rgb/datosabiertos-devops
+      GKE_NAMESPACE: chatbot
+      GKE_POD: n8n-0
+      WORKFLOW_ID: valledataLocal01
+      GCP_PROJECT: ${{ inputs.environment == 'prod' && 'co-valledata-pub-prd' || 'co-valledata-prd' }}
+      GCS_BUCKET: ${{ inputs.environment == 'prod' && 'co-valledata-pub-prd-n8n-workflow-backups' || 'co-valledata-prd-n8n-workflow-backups' }}
+
+    steps:
+      # Solo para el nodes.json del smoke-test (los IDs de nodo contra los
+      # que navegar) — el contenido a restaurar sale del backup, no de acá.
+      - name: Checkout ValleData_chatboot (nodes.json para el smoke-test)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.environment == 'prod' && 'master' || 'qa' }}
+
+      # Acá viven los scripts que se ejecutan dentro del pod y el overlay
+      # donde se commitea el marcador.
+      - name: Checkout datosabiertos-devops
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DEVOPS_REPO }}
+          ref: develop
+          token: ${{ secrets.DEVOPS_REPO_TOKEN }}
+          path: datosabiertos-devops
+
+      # -----------------------------------------------------------------
+      # Auth vía Workload Identity Federation — vars.WIF_PROVIDER/
+      # GCP_SA_EMAIL resuelven al Environment activo ("qa" o "prod-deploy"
+      # según el input), mismas credenciales que usan los deploys de cada
+      # ambiente.
+      # -----------------------------------------------------------------
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SA_EMAIL }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Install gke-gcloud-auth-plugin
+        run: gcloud components install gke-gcloud-auth-plugin --quiet
+
+      - name: Get gke-primary credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: gke-primary
+          location: us-east1
+          project_id: ${{ env.GCP_PROJECT }}
+
+      # -----------------------------------------------------------------
+      # Backup del estado ACTUAL antes de tocarlo, aunque esté roto — por
+      # si hace falta diagnosticar después qué había antes del rollback.
+      # -----------------------------------------------------------------
+      - name: Backup del estado actual (pre-rollback)
+        run: |
+          set -euo pipefail
+          kubectl exec -i -n "$GKE_NAMESPACE" "$GKE_POD" -- sh -s "$WORKFLOW_ID" \
+            < datosabiertos-devops/scripts/chatbot/exportar-workflow-pod.sh
+          kubectl cp "$GKE_NAMESPACE/$GKE_POD:/tmp/backup.json" ./pre-rollback.json
+          TS=$(date -u +%Y%m%dT%H%M%SZ)
+          PRE_OBJ="${{ inputs.environment }}/pre-rollback-${TS}-${{ github.run_id }}.json"
+          gcloud storage cp ./pre-rollback.json "gs://$GCS_BUCKET/$PRE_OBJ"
+          echo "PRE_OBJ=$PRE_OBJ" >> "$GITHUB_ENV"
+          echo "estado previo respaldado en gs://$GCS_BUCKET/$PRE_OBJ"
+
+      - name: Descargar el backup a restaurar
+        run: |
+          set -euo pipefail
+          gcloud storage cp "gs://$GCS_BUCKET/${{ inputs.backup_object }}" ./restore.json
+
+      # -----------------------------------------------------------------
+      # Mismo mecanismo que un deploy normal: "restaurar" es reimportar un
+      # JSON viejo con el mismo script. Sin allowFailure ni "|| echo": si
+      # el rollout falla, el job falla en rojo.
+      # -----------------------------------------------------------------
+      - name: Restaurar el workflow
+        run: |
+          set -euo pipefail
+          kubectl cp ./restore.json "$GKE_NAMESPACE/$GKE_POD:/tmp/wf.json"
+          kubectl exec -i -n "$GKE_NAMESPACE" "$GKE_POD" -- sh -s "$WORKFLOW_ID" \
+            < datosabiertos-devops/scripts/chatbot/importar-workflow-pod.sh
+          kubectl rollout restart statefulset/n8n -n "$GKE_NAMESPACE"
+          kubectl rollout status statefulset/n8n -n "$GKE_NAMESPACE" --timeout=300s
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          kubectl cp ./nodes.json "$GKE_NAMESPACE/$GKE_POD:/tmp/nodes.json"
+          kubectl exec -i -n "$GKE_NAMESPACE" "$GKE_POD" -- sh -s \
+            < datosabiertos-devops/scripts/chatbot/prueba-humo-pod.sh
+
+      # -----------------------------------------------------------------
+      # Commit-back a datosabiertos-devops: deja registrado que el estado
+      # actual del ambiente viene de un rollback, a qué backup y desde qué
+      # estado previo (por si hace falta deshacer el rollback también).
+      # -----------------------------------------------------------------
+      - name: Commit-back del marcador de rollback
+        working-directory: datosabiertos-devops
+        run: |
+          set -euo pipefail
+          mkdir -p "k8s/environments/${{ inputs.environment }}/chatbot"
+          cat > "k8s/environments/${{ inputs.environment }}/chatbot/DEPLOYED.env" <<EOF
+          WORKFLOW_SHA=rollback
+          DEPLOYED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          BACKUP=gs://${{ env.GCS_BUCKET }}/${{ inputs.backup_object }}
+          ROLLBACK_FROM=gs://${{ env.GCS_BUCKET }}/${{ env.PRE_OBJ }}
+          EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "k8s/environments/${{ inputs.environment }}/chatbot/DEPLOYED.env"
+          git commit -m "rollback(n8n ${{ inputs.environment }}): restaura ${{ inputs.backup_object }}"
+          git push origin develop
